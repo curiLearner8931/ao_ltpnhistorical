@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import logging
+import os
 import requests
 from utils import get_connection
 
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # Initialize FastAPI
 app = FastAPI()
 
+# Allow frontend on Vercel to access this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://stock-savvy-safar-app.vercel.app"],
@@ -20,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request models
+# --- Request Models ---
 class Holding(BaseModel):
     symbol: str
     token: str
@@ -28,14 +30,16 @@ class Holding(BaseModel):
 
 class HistoricalRequest(BaseModel):
     symboltoken: str
-    interval: str  # e.g., "ONE_DAY", "FIVE_MINUTE"
+    interval: str  # "ONE_DAY", "FIVE_MINUTE", etc.
     fromdate: str  # format: "YYYY-MM-DD HH:MM"
     todate: str    # format: "YYYY-MM-DD HH:MM"
 
+# --- Health Check ---
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Angel One API is live."}
 
+# --- Live Prices ---
 @app.post("/live-prices")
 async def get_live_prices(holdings: List[Holding]):
     logging.info(f"Received {len(holdings)} holdings for live price fetch.")
@@ -48,17 +52,37 @@ async def get_live_prices(holdings: List[Holding]):
         logging.error(f"Connection failed: {e}")
         raise HTTPException(status_code=500, detail="Angel One login failed")
 
+    jwt = getattr(obj, "jwt_token", None)
+    if not jwt:
+        raise HTTPException(status_code=500, detail="Missing JWT token")
+
+    headers = {
+        "X-PrivateKey": os.getenv("API_KEY"),
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "Authorization": f"Bearer {jwt}",
+        "Content-Type": "application/json"
+    }
+
     results = []
     for stock in holdings:
         try:
             logging.info(f"Fetching price for {stock.symbol}")
-            response = obj.ltpData(
-                exchange=stock.exchange,
-                tradingsymbol=stock.symbol,
-                symboltoken=stock.token
+            payload = {
+                "exchange": stock.exchange,
+                "tradingsymbol": stock.symbol,
+                "symboltoken": stock.token
+            }
+            response = requests.post(
+                "https://apiconnect.angelone.in/rest/secure/market/v1/ltp",
+                headers=headers,
+                json=payload
             )
-            if response.get("data"):
-                data = response["data"]
+            res_json = response.json()
+            if res_json.get("data"):
+                data = res_json["data"]
                 results.append({
                     "symbol": stock.symbol,
                     "price": data.get("ltp"),
@@ -67,11 +91,18 @@ async def get_live_prices(holdings: List[Holding]):
                     "last_traded_time": data.get("last_traded_time")
                 })
             else:
-                results.append({"symbol": stock.symbol, "error": "No data received"})
+                logging.warning(f"No data for {stock.symbol}: {res_json}")
+                results.append({
+                    "symbol": stock.symbol,
+                    "error": res_json.get("message", "No data received")
+                })
         except Exception as e:
+            logging.error(f"Error fetching price for {stock.symbol}: {str(e)}")
             results.append({"symbol": stock.symbol, "error": str(e)})
+
     return {"live_prices": results}
 
+# --- Historical Data ---
 @app.post("/historical-data")
 async def get_historical_data(payload: HistoricalRequest):
     logging.info(f"Fetching historical data: {payload}")
@@ -82,7 +113,12 @@ async def get_historical_data(payload: HistoricalRequest):
 
     headers = {
         "Authorization": f"Bearer {obj.jwt_token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-PrivateKey": os.getenv("API_KEY"),
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00"
     }
 
     request_data = {
